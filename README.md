@@ -56,6 +56,9 @@ also has these hard safety rails:
 - a SenCache-inspired sensitivity veto: after live observations, reuse must
   satisfy both the existing accumulated-error controller and an online estimate
   of latent-change plus sigma-change sensitivity;
+- a SeaCache-inspired temporal spectral distance: where H3 layout metadata is
+  available, it replaces raw input L1 with a scheduler-aligned, frequency-aware
+  per-frame feature distance;
 - rejection of EasyCache, CacheDiT, T8 Block Cache and other `double_block`
   patch replacements.
 
@@ -77,6 +80,23 @@ If that error exceeds `sensitivity_budget`, the stage runs exactly. The guard
 stores scalars only, so it adds no persistent GPU activation tensor beyond the
 existing residual and stage-input cache. It is an H3-specific
 **SenCache-inspired** safety mechanism, not an official SenCache port.
+
+### SeaCache adaptation boundary
+
+SeaCache filters a model's structured video representation over temporal and
+spatial frequency axes before measuring cache distance. Its official code
+supports Wan2.1 and HunyuanVideo, while ComfyUI support is still listed as
+planned. Native H3 patch calls provide the video-token span and frame count,
+but not a stable H×W token grid. Applying a fabricated 3-D FFT would be
+incorrect and could raise peak VRAM.
+
+This node therefore uses the exact scheduler-aligned Wiener-filter form only
+along the reliable temporal axis: it averages each frame's video tokens into a
+small frame-feature representation, applies an FFT/iFFT temporal SEA filter,
+and feeds its relative-L1 distance to the existing controller. It retains no
+filtered tensors, and falls back to raw relative-L1 if layout metadata is not
+present. The `sea_filter` switch controls this **SeaCache-inspired temporal
+projection**; it is not an official full SeaCache H3 port.
 
 ## Why stages instead of a whole-model cache?
 
@@ -120,7 +140,8 @@ Do not connect it together with another H3 block-replacement or cache node.
 - **Fast — self-calibrating:** three consecutive hits; inspect motion, identity,
   text and audio carefully.
 - **Custom — experimental values:** exposes error budget, stage count,
-  denoising window, hit limit, temporal guard and the sensitivity gate.
+  denoising window, hit limit, temporal guard, SeaCache temporal filter and the
+  sensitivity gate.
 
 The numeric thresholds are provisional. They are not transferable from Wan,
 HunyuanVideo, Open-Sora, EasyCache, NaviCache or BWCache, because their change
@@ -178,6 +199,11 @@ this repository.
    [official implementation](https://github.com/vita-epfl/SenCache). Used to verify the Jacobian-weighted
    `J_z * Δz + J_t * Δt` reuse-gate form; this project replaces unavailable H3
    offline Jacobians with online stage-local scalar estimates.
+8. Chung et al., [SeaCache: Spectral-Evolution-Aware Cache for Accelerating
+   Diffusion Models](https://arxiv.org/abs/2602.18993), CVPR 2026, and the
+   [official implementation](https://github.com/jiwoogit/SeaCache). Used for
+   the scheduler-aligned spectral filtering principle; only its temporal,
+   layout-safe projection is implemented here.
 
 If this project reports research-comparable results, it should cite the papers
 above in addition to clearly identifying this implementation as independent.

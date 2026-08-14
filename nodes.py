@@ -20,6 +20,7 @@ class CacheConfig:
     temporal_limit: float = 0.11
     sensitivity_guard: bool = True
     sigma_sensitivity_weight: float = 0.25
+    sea_filter: bool = True
 
 
 PRESETS = {
@@ -37,6 +38,7 @@ class StageState:
     previous_input: torch.Tensor | None = None
     pending_input: torch.Tensor | None = None
     previous_sigma: float | None = None
+    previous_input_sigma: float | None = None
     pending_sigma: float | None = None
     sigma_sensitivity: float | None = None
     use_cache: bool = False
@@ -48,6 +50,7 @@ class StageState:
         self.previous_input = None
         self.pending_input = None
         self.previous_sigma = None
+        self.previous_input_sigma = None
         self.pending_sigma = None
         self.sigma_sensitivity = None
         self.use_cache = False
@@ -151,6 +154,42 @@ class AdaptiveStageCache:
         return float(frame_change.max().item()) <= self.config.temporal_limit
 
     @staticmethod
+    def _sea_temporal_filter(features: torch.Tensor, sigma: float) -> torch.Tensor:
+        """Apply SeaCache's scheduler-aligned Wiener form along time only.
+
+        H3's public ComfyUI patch payload exposes a video-token range and frame
+        count, but not a reliable 3-D latent grid.  Reducing each frame to its
+        token mean lets us retain the temporal spectral component without
+        inventing a spatial layout or materializing another activation cache.
+        """
+        count = features.shape[0]
+        if count < 2:
+            return features
+        value = features.float()
+        frequency = torch.fft.rfftfreq(count, device=value.device, dtype=torch.float32).abs()
+        sigma = min(max(float(sigma), 1e-6), 1.0 - 1e-6)
+        signal, noise = 1.0 - sigma, sigma
+        spectrum_prior = 1.0 / frequency.square().clamp(min=1e-16)
+        gain = signal * spectrum_prior / (signal * signal * spectrum_prior + noise * noise + 1e-16)
+        gain = gain / gain.mean().clamp(min=1e-16)
+        return torch.fft.irfft(torch.fft.rfft(value, dim=0) * gain[:, None], n=count, dim=0)
+
+    def _cache_input_change(self, current: torch.Tensor, previous: torch.Tensor, current_sigma: float, previous_sigma: float | None) -> float:
+        context = self.current
+        if not self.config.sea_filter or context is None or context.video_slice is None or not context.latent_frames:
+            return relative_l1(current, previous)
+        start, stop = context.video_slice
+        now, old = current[start:stop], previous[start:stop]
+        if now.shape != old.shape or now.shape[0] % context.latent_frames:
+            return relative_l1(current, previous)
+        rows = now.shape[0] // context.latent_frames
+        now = now.reshape(context.latent_frames, rows, -1).mean(dim=1)
+        old = old.reshape(context.latent_frames, rows, -1).mean(dim=1)
+        now = self._sea_temporal_filter(now, current_sigma)
+        old = self._sea_temporal_filter(old, previous_sigma if previous_sigma is not None else current_sigma)
+        return relative_l1(now, old)
+
+    @staticmethod
     def _relative_sigma_change(current: float | None, previous: float | None) -> float:
         if current is None or previous is None:
             return 0.0
@@ -172,7 +211,9 @@ class AdaptiveStageCache:
         state.use_cache = False
         if stage_index == 0 or not self.in_window() or state.cached_residual is None or state.previous_input is None:
             return False
-        input_change = relative_l1(x, state.previous_input)
+        input_change = self._cache_input_change(
+            x, state.previous_input, context.previous_sigma, state.previous_input_sigma
+        )
         guard = self._temporal_ok(x, state.previous_input)
         sigma_change = self._relative_sigma_change(context.previous_sigma, state.previous_sigma)
         sensitivity_error = None
@@ -186,6 +227,7 @@ class AdaptiveStageCache:
         if state.controller.should_reuse(input_change, guard, sensitivity_error):
             state.controller.record_reuse(input_change)
             state.previous_input = x.detach()
+            state.previous_input_sigma = context.previous_sigma
             state.pending_input = None
             state.pending_sigma = None
             # The residual itself still originates at previous_sigma.  Keep
@@ -206,7 +248,9 @@ class AdaptiveStageCache:
             return
         if state.pending_input is None:
             raise RuntimeError("AdaptiveStageCache lost the stage input")
-        input_change = relative_l1(state.pending_input, state.previous_input) if state.previous_input is not None else None
+        input_change = self._cache_input_change(
+            state.pending_input, state.previous_input, state.pending_sigma, state.previous_input_sigma
+        ) if state.previous_input is not None else None
         # Keep only residual + latest stage input persistently.  The previous
         # output is reconstructed for this full-step observation and is then
         # released, saving one full activation-sized tensor per cache stage.
@@ -222,6 +266,7 @@ class AdaptiveStageCache:
                 )
         state.cached_residual = (output - state.pending_input).detach()
         state.previous_input = state.pending_input
+        state.previous_input_sigma = state.pending_sigma
         state.pending_input = None
         state.previous_sigma = state.pending_sigma
         state.pending_sigma = None
@@ -301,12 +346,13 @@ class ApplyMiniMaxH3AdaptiveStageCache:
             "sensitivity_guard": ("BOOLEAN", {"default": True}),
             "sensitivity_budget": ("FLOAT", {"default": 0.080, "min": 0.001, "max": 2.0, "step": 0.005}),
             "sigma_sensitivity_weight": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "sea_filter": ("BOOLEAN", {"default": True}),
         }}
 
     RETURN_TYPES, FUNCTION, CATEGORY = ("MODEL",), "apply", "MiniMax H3/optimization"
-    DESCRIPTION = "Experimental stage-wise residual cache with NaviCache-style calibration and a SenCache-inspired sensitivity veto."
+    DESCRIPTION = "Experimental stage-wise residual cache with SeaCache spectral distance, NaviCache calibration and a SenCache-inspired sensitivity veto."
 
-    def apply(self, model, mode, error_budget, stage_count, start_percent, end_percent, max_consecutive_hits, temporal_guard, sensitivity_guard, sensitivity_budget, sigma_sensitivity_weight):
+    def apply(self, model, mode, error_budget, stage_count, start_percent, end_percent, max_consecutive_hits, temporal_guard, sensitivity_guard, sensitivity_budget, sigma_sensitivity_weight, sea_filter):
         if mode == CUSTOM_MODE:
             if start_percent >= end_percent:
                 raise ValueError("start_percent must be smaller than end_percent")
@@ -322,8 +368,9 @@ class ApplyMiniMaxH3AdaptiveStageCache:
                 temporal_guard=temporal_guard,
                 sensitivity_guard=sensitivity_guard,
                 sigma_sensitivity_weight=sigma_sensitivity_weight,
+                sea_filter=sea_filter,
             )
-            label = f"Custom budget {error_budget:.3f}, stages {stage_count}, sensitivity guard {sensitivity_guard}"
+            label = f"Custom budget {error_budget:.3f}, stages {stage_count}, SEA filter {sea_filter}"
         else:
             config, label = PRESETS[mode], mode
         diffusion_model = model.get_model_object("diffusion_model")
