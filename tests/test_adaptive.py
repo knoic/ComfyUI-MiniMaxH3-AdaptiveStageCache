@@ -31,3 +31,11 @@ def test_invalid_input_never_reuses():
     c = SelfCalibratingController(ControllerConfig(alignment_steps=1))
     c.observe(0.1, 0.1)
     assert not c.should_reuse(math.nan)
+
+
+def test_uncertainty_is_scaled_into_output_change_units():
+    c = SelfCalibratingController(ControllerConfig(error_budget=0.055, alignment_steps=1, process_noise=0.004, measurement_noise=0.012))
+    c.observe(0.1, 0.01)
+    # A small latent change should be eligible.  The uncertainty is a ratio
+    # and must be scaled by this input change before comparison with budget.
+    assert c.should_reuse(0.01)

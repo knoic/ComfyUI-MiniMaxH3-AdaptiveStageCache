@@ -29,7 +29,8 @@ G_s(h_s,current) ≈ h_s,current + residual_s,previous_full
 ```
 
 The first stage always executes. The remaining H3 blocks are split into a small
-number of contiguous stages (four by default), so the node can refresh one
+number of contiguous stages (two by default: one live probe plus one cacheable
+tail), so the node can refresh one
 stage independently of another. This is intentionally different from a full
 model residual cache, which skips every transformer block at once.
 

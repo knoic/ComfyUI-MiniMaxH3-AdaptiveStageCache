@@ -54,7 +54,12 @@ class SelfCalibratingController:
         if self.consecutive_hits >= self.config.max_consecutive_hits:
             return False
         predicted_change = max(self.ratio, 0.0) * input_change
-        predicted_uncertainty = math.sqrt(max(self.variance + self.config.process_noise, 0.0))
+        # ``variance`` is in sensitivity-ratio units, while ``error_budget``
+        # is in output-change units.  Convert it through the current input
+        # change before applying the safety margin.  Adding sqrt(variance)
+        # directly made the default budget impossible to satisfy, so no cache
+        # hit could occur even after a successful alignment.
+        predicted_uncertainty = math.sqrt(max(self.variance + self.config.process_noise, 0.0)) * input_change
         proposed_error = self.accumulated_error + predicted_change + self.config.uncertainty_weight * predicted_uncertainty
         return math.isfinite(proposed_error) and proposed_error < self.config.error_budget
 

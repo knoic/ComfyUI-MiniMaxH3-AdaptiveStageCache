@@ -15,7 +15,7 @@ class CacheConfig:
     controller: ControllerConfig
     start_percent: float = 0.12
     end_percent: float = 0.88
-    stage_count: int = 4
+    stage_count: int = 2
     temporal_guard: bool = True
     temporal_limit: float = 0.11
 
@@ -33,7 +33,6 @@ class StageState:
     controller: SelfCalibratingController
     cached_residual: torch.Tensor | None = None
     previous_input: torch.Tensor | None = None
-    previous_output: torch.Tensor | None = None
     pending_input: torch.Tensor | None = None
     use_cache: bool = False
     hits: int = 0
@@ -42,7 +41,6 @@ class StageState:
     def clear(self) -> None:
         self.cached_residual = None
         self.previous_input = None
-        self.previous_output = None
         self.pending_input = None
         self.use_cache = False
         self.controller.reset()
@@ -149,6 +147,12 @@ class AdaptiveStageCache:
         if context is None:
             raise RuntimeError("AdaptiveStageCache called outside model execution")
         state = context.stages[stage_index]
+        # The first stage is only a live probe.  Do not retain its feature
+        # tensors, otherwise it silently consumes the same memory as a cached
+        # stage while it is never eligible for reuse.
+        if stage_index == 0:
+            state.use_cache = False
+            return False
         state.pending_input = x.detach()
         state.use_cache = False
         if stage_index == 0 or not self.in_window() or state.cached_residual is None or state.previous_input is None:
@@ -170,13 +174,20 @@ class AdaptiveStageCache:
         if context is None:
             raise RuntimeError("AdaptiveStageCache has no active context")
         state = context.stages[stage_index]
+        if stage_index == 0:
+            self.full_calls += 1
+            return
         if state.pending_input is None:
             raise RuntimeError("AdaptiveStageCache lost the stage input")
         input_change = relative_l1(state.pending_input, state.previous_input) if state.previous_input is not None else None
-        output_change = relative_l1(output, state.previous_output) if state.previous_output is not None else None
+        # Keep only residual + latest stage input persistently.  The previous
+        # output is reconstructed for this full-step observation and is then
+        # released, saving one full activation-sized tensor per cache stage.
+        previous_output = (state.previous_input + state.cached_residual) if state.previous_input is not None and state.cached_residual is not None else None
+        output_change = relative_l1(output, previous_output) if previous_output is not None else None
         state.controller.observe(input_change, output_change)
         state.cached_residual = (output - state.pending_input).detach()
-        state.previous_input, state.previous_output = state.pending_input, output.detach()
+        state.previous_input = state.pending_input
         state.pending_input = None
         state.full_steps += 1
         self.full_calls += 1
@@ -185,15 +196,17 @@ class AdaptiveStageCache:
         state = self.current.stages[stage_index]
         if state.cached_residual is None:
             raise RuntimeError("AdaptiveStageCache has no residual for a cached stage")
-        # Keep the next full observation adjacent to this approximate output.
-        # Otherwise its output delta would span several skipped steps while its
-        # input delta spans one step, corrupting the sensitivity measurement.
-        output = x + state.cached_residual
-        state.previous_output = output.detach()
-        return output
+        return x + state.cached_residual
 
     def summary(self) -> str:
-        return f"cached stages {self.cached_stages}; full stage executions {self.full_calls}; stages {self.ranges}"
+        contexts = [self.current] if self.current is not None else list(self.contexts.values())
+        persistent_tensors = 2 * sum(
+            1
+            for context in contexts
+            for index, state in enumerate(context.stages)
+            if index and state.cached_residual is not None and state.previous_input is not None
+        )
+        return f"cached stages {self.cached_stages}; full stage executions {self.full_calls}; stages {self.ranges}; persistent cache tensors {persistent_tensors}"
 
 
 def make_block_patch(cache: AdaptiveStageCache, block_index: int, stage_index: int, first: int, last: int):
@@ -244,7 +257,7 @@ class ApplyMiniMaxH3AdaptiveStageCache:
             "model": ("MODEL",),
             "mode": ([*PRESETS, CUSTOM_MODE], {"default": "Balanced — self-calibrating"}),
             "error_budget": ("FLOAT", {"default": 0.055, "min": 0.005, "max": 1.0, "step": 0.005}),
-            "stage_count": ("INT", {"default": 4, "min": 2, "max": 16}),
+            "stage_count": ("INT", {"default": 2, "min": 2, "max": 16}),
             "start_percent": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
             "end_percent": ("FLOAT", {"default": 0.88, "min": 0.0, "max": 1.0, "step": 0.01}),
             "max_consecutive_hits": ("INT", {"default": 2, "min": 1, "max": 8}),
