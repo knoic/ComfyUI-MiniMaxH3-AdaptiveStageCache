@@ -185,7 +185,12 @@ class AdaptiveStageCache:
         state = self.current.stages[stage_index]
         if state.cached_residual is None:
             raise RuntimeError("AdaptiveStageCache has no residual for a cached stage")
-        return x + state.cached_residual
+        # Keep the next full observation adjacent to this approximate output.
+        # Otherwise its output delta would span several skipped steps while its
+        # input delta spans one step, corrupting the sensitivity measurement.
+        output = x + state.cached_residual
+        state.previous_output = output.detach()
+        return output
 
     def summary(self) -> str:
         return f"cached stages {self.cached_stages}; full stage executions {self.full_calls}; stages {self.ranges}"
