@@ -39,3 +39,10 @@ def test_uncertainty_is_scaled_into_output_change_units():
     # A small latent change should be eligible.  The uncertainty is a ratio
     # and must be scaled by this input change before comparison with budget.
     assert c.should_reuse(0.01)
+
+
+def test_sensitivity_gate_can_veto_a_ready_cache():
+    c = SelfCalibratingController(ControllerConfig(alignment_steps=1, sensitivity_budget=0.01))
+    c.observe(0.1, 0.01)
+    assert c.should_reuse(0.01, sensitivity_error=0.005)
+    assert not c.should_reuse(0.01, sensitivity_error=0.02)

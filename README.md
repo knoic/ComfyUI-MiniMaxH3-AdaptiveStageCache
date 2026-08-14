@@ -53,8 +53,30 @@ also has these hard safety rails:
 - separate contexts for ComfyUI condition UUIDs;
 - optional maximum-per-frame target-video latent guard where H3 layout metadata
   is available;
+- a SenCache-inspired sensitivity veto: after live observations, reuse must
+  satisfy both the existing accumulated-error controller and an online estimate
+  of latent-change plus sigma-change sensitivity;
 - rejection of EasyCache, CacheDiT, T8 Block Cache and other `double_block`
   patch replacements.
+
+### SenCache adaptation boundary
+
+SenCache's released implementation uses offline, per-timestep Jacobian norms
+precomputed for Wan, CogVideoX and LTX models. Those tables are neither
+available for MiniMax H3 nor transferable across architectures. This node does
+**not** load or pretend to reproduce those weights. Instead, it learns a
+per-stage scalar sigma sensitivity only from fresh H3 stage executions and
+uses it as a conservative second gate:
+
+```text
+estimated_sensitivity_error = local_latent_sensitivity * Δlatent
+                              + sigma_weight * learned_sigma_sensitivity * Δsigma
+```
+
+If that error exceeds `sensitivity_budget`, the stage runs exactly. The guard
+stores scalars only, so it adds no persistent GPU activation tensor beyond the
+existing residual and stage-input cache. It is an H3-specific
+**SenCache-inspired** safety mechanism, not an official SenCache port.
 
 ## Why stages instead of a whole-model cache?
 
@@ -98,7 +120,7 @@ Do not connect it together with another H3 block-replacement or cache node.
 - **Fast — self-calibrating:** three consecutive hits; inspect motion, identity,
   text and audio carefully.
 - **Custom — experimental values:** exposes error budget, stage count,
-  denoising window, hit limit and temporal guard.
+  denoising window, hit limit, temporal guard and the sensitivity gate.
 
 The numeric thresholds are provisional. They are not transferable from Wan,
 HunyuanVideo, Open-Sora, EasyCache, NaviCache or BWCache, because their change
@@ -151,6 +173,10 @@ this repository.
 6. DuckyShell, [ComfyUI MiniMax H3 FirstBlockCache](https://github.com/duckyshell/ComfyUI-MiniMaxH3-FirstBlockCache)
    (MIT). Used only as a ComfyUI-native H3 patching and cache-lifecycle
    compatibility reference.
+7. [SenCache official implementation](https://github.com/vita-epfl/SenCache)
+   and its accompanying paper. Used to verify the Jacobian-weighted
+   `J_z * Δz + J_t * Δt` reuse-gate form; this project replaces unavailable H3
+   offline Jacobians with online stage-local scalar estimates.
 
 If this project reports research-comparable results, it should cite the papers
 above in addition to clearly identifying this implementation as independent.

@@ -19,6 +19,7 @@ class ControllerConfig:
     process_noise: float = 0.004
     measurement_noise: float = 0.012
     uncertainty_weight: float = 1.0
+    sensitivity_budget: float = 0.080
 
 
 @dataclass
@@ -48,8 +49,18 @@ class SelfCalibratingController:
     def ready(self) -> bool:
         return self.ratio is not None and self.observations >= self.config.alignment_steps
 
-    def should_reuse(self, input_change: float, external_guard: bool = True) -> bool:
+    def should_reuse(
+        self,
+        input_change: float,
+        external_guard: bool = True,
+        sensitivity_error: Optional[float] = None,
+    ) -> bool:
         if not self.ready or not external_guard or not math.isfinite(input_change):
+            return False
+        if sensitivity_error is not None and (
+            not math.isfinite(sensitivity_error)
+            or sensitivity_error >= self.config.sensitivity_budget
+        ):
             return False
         if self.consecutive_hits >= self.config.max_consecutive_hits:
             return False

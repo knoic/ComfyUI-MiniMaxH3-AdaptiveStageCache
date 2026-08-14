@@ -18,6 +18,8 @@ class CacheConfig:
     stage_count: int = 2
     temporal_guard: bool = True
     temporal_limit: float = 0.11
+    sensitivity_guard: bool = True
+    sigma_sensitivity_weight: float = 0.25
 
 
 PRESETS = {
@@ -34,6 +36,9 @@ class StageState:
     cached_residual: torch.Tensor | None = None
     previous_input: torch.Tensor | None = None
     pending_input: torch.Tensor | None = None
+    previous_sigma: float | None = None
+    pending_sigma: float | None = None
+    sigma_sensitivity: float | None = None
     use_cache: bool = False
     hits: int = 0
     full_steps: int = 0
@@ -42,6 +47,9 @@ class StageState:
         self.cached_residual = None
         self.previous_input = None
         self.pending_input = None
+        self.previous_sigma = None
+        self.pending_sigma = None
+        self.sigma_sensitivity = None
         self.use_cache = False
         self.controller.reset()
         self.hits = 0
@@ -142,6 +150,12 @@ class AdaptiveStageCache:
         frame_change = (now - old).abs().mean(dim=(1, 2)) / old.abs().mean(dim=(1, 2)).clamp(min=1e-8)
         return float(frame_change.max().item()) <= self.config.temporal_limit
 
+    @staticmethod
+    def _relative_sigma_change(current: float | None, previous: float | None) -> float:
+        if current is None or previous is None:
+            return 0.0
+        return abs(current - previous) / max(abs(previous), 1e-8)
+
     def begin_stage(self, stage_index: int, x: torch.Tensor) -> bool:
         context = self.current
         if context is None:
@@ -154,15 +168,28 @@ class AdaptiveStageCache:
             state.use_cache = False
             return False
         state.pending_input = x.detach()
+        state.pending_sigma = context.previous_sigma
         state.use_cache = False
         if stage_index == 0 or not self.in_window() or state.cached_residual is None or state.previous_input is None:
             return False
         input_change = relative_l1(x, state.previous_input)
         guard = self._temporal_ok(x, state.previous_input)
-        if state.controller.should_reuse(input_change, guard):
+        sigma_change = self._relative_sigma_change(context.previous_sigma, state.previous_sigma)
+        sensitivity_error = None
+        if self.config.sensitivity_guard and state.sigma_sensitivity is not None:
+            # SenCache gates reuse with J_z * Δz + J_t * Δt.  H3 has no
+            # released offline Jacobian table, so estimate both local terms
+            # online and keep this as a conservative veto, never a force-hit.
+            latent_term = max(state.controller.ratio or 0.0, 0.0) * input_change
+            sigma_term = self.config.sigma_sensitivity_weight * state.sigma_sensitivity * sigma_change
+            sensitivity_error = latent_term + sigma_term
+        if state.controller.should_reuse(input_change, guard, sensitivity_error):
             state.controller.record_reuse(input_change)
             state.previous_input = x.detach()
             state.pending_input = None
+            state.pending_sigma = None
+            # The residual itself still originates at previous_sigma.  Keep
+            # that anchor until a true full execution refreshes it.
             state.use_cache = True
             state.hits += 1
             self.cached_stages += 1
@@ -186,9 +213,18 @@ class AdaptiveStageCache:
         previous_output = (state.previous_input + state.cached_residual) if state.previous_input is not None and state.cached_residual is not None else None
         output_change = relative_l1(output, previous_output) if previous_output is not None else None
         state.controller.observe(input_change, output_change)
+        sigma_change = self._relative_sigma_change(state.pending_sigma, state.previous_sigma)
+        if output_change is not None and sigma_change > 1e-8:
+            measured_sigma_sensitivity = output_change / sigma_change
+            if math.isfinite(measured_sigma_sensitivity):
+                state.sigma_sensitivity = measured_sigma_sensitivity if state.sigma_sensitivity is None else (
+                    0.5 * state.sigma_sensitivity + 0.5 * measured_sigma_sensitivity
+                )
         state.cached_residual = (output - state.pending_input).detach()
         state.previous_input = state.pending_input
         state.pending_input = None
+        state.previous_sigma = state.pending_sigma
+        state.pending_sigma = None
         state.full_steps += 1
         self.full_calls += 1
 
@@ -262,17 +298,32 @@ class ApplyMiniMaxH3AdaptiveStageCache:
             "end_percent": ("FLOAT", {"default": 0.88, "min": 0.0, "max": 1.0, "step": 0.01}),
             "max_consecutive_hits": ("INT", {"default": 2, "min": 1, "max": 8}),
             "temporal_guard": ("BOOLEAN", {"default": True}),
+            "sensitivity_guard": ("BOOLEAN", {"default": True}),
+            "sensitivity_budget": ("FLOAT", {"default": 0.080, "min": 0.001, "max": 2.0, "step": 0.005}),
+            "sigma_sensitivity_weight": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05}),
         }}
 
     RETURN_TYPES, FUNCTION, CATEGORY = ("MODEL",), "apply", "MiniMax H3/optimization"
-    DESCRIPTION = "Experimental stage-wise residual cache with a NaviCache-inspired self-calibrating controller."
+    DESCRIPTION = "Experimental stage-wise residual cache with NaviCache-style calibration and a SenCache-inspired sensitivity veto."
 
-    def apply(self, model, mode, error_budget, stage_count, start_percent, end_percent, max_consecutive_hits, temporal_guard):
+    def apply(self, model, mode, error_budget, stage_count, start_percent, end_percent, max_consecutive_hits, temporal_guard, sensitivity_guard, sensitivity_budget, sigma_sensitivity_weight):
         if mode == CUSTOM_MODE:
             if start_percent >= end_percent:
                 raise ValueError("start_percent must be smaller than end_percent")
-            config = CacheConfig(ControllerConfig(error_budget, max_consecutive_hits=max_consecutive_hits), start_percent, end_percent, stage_count, temporal_guard)
-            label = f"Custom budget {error_budget:.3f}, stages {stage_count}"
+            config = CacheConfig(
+                controller=ControllerConfig(
+                    error_budget=error_budget,
+                    max_consecutive_hits=max_consecutive_hits,
+                    sensitivity_budget=sensitivity_budget,
+                ),
+                start_percent=start_percent,
+                end_percent=end_percent,
+                stage_count=stage_count,
+                temporal_guard=temporal_guard,
+                sensitivity_guard=sensitivity_guard,
+                sigma_sensitivity_weight=sigma_sensitivity_weight,
+            )
+            label = f"Custom budget {error_budget:.3f}, stages {stage_count}, sensitivity guard {sensitivity_guard}"
         else:
             config, label = PRESETS[mode], mode
         diffusion_model = model.get_model_object("diffusion_model")
