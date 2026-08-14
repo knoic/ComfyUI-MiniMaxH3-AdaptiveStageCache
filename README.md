@@ -173,8 +173,9 @@ this repository.
 6. DuckyShell, [ComfyUI MiniMax H3 FirstBlockCache](https://github.com/duckyshell/ComfyUI-MiniMaxH3-FirstBlockCache)
    (MIT). Used only as a ComfyUI-native H3 patching and cache-lifecycle
    compatibility reference.
-7. [SenCache official implementation](https://github.com/vita-epfl/SenCache)
-   and its accompanying paper. Used to verify the Jacobian-weighted
+7. [SenCache: Accelerating Diffusion Model Inference via Sensitivity-Aware
+   Caching](https://arxiv.org/abs/2602.24208), CVPR 2026, and the
+   [official implementation](https://github.com/vita-epfl/SenCache). Used to verify the Jacobian-weighted
    `J_z * Δz + J_t * Δt` reuse-gate form; this project replaces unavailable H3
    offline Jacobians with online stage-local scalar estimates.
 
