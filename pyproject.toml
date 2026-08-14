@@ -1,0 +1,8 @@
+[project]
+name = "comfyui-minimax-h3-adaptive-stage-cache"
+version = "0.1.0"
+description = "Experimental NaviCache-inspired stage-wise cache for native ComfyUI MiniMax H3"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
